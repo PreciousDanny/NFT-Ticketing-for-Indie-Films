@@ -11,6 +11,9 @@
 (define-constant err-transfer-failed (err u107))
 (define-constant err-minting-disabled (err u108))
 (define-constant err-invalid-recipient (err u109))
+(define-constant err-already-reviewed (err u110))
+(define-constant err-invalid-rating (err u111))
+(define-constant err-review-not-found (err u112))
 
 (define-data-var last-token-id uint u0)
 (define-data-var last-film-id uint u0)
@@ -42,6 +45,18 @@
 
 (define-map user-access principal (list 100 uint))
 (define-map film-revenues uint uint)
+
+(define-map film-reviews {user: principal, film-id: uint} {
+    rating: uint,
+    comment: (string-ascii 500),
+    review-date: uint
+})
+
+(define-map film-review-stats uint {
+    total-reviews: uint,
+    average-rating: uint,
+    total-rating-points: uint
+})
 
 (define-read-only (get-last-token-id)
     (ok (var-get last-token-id))
@@ -85,6 +100,18 @@
 
 (define-read-only (get-platform-fee-rate)
     (ok (var-get platform-fee-rate))
+)
+
+(define-read-only (get-film-review (user principal) (film-id uint))
+    (ok (map-get? film-reviews {user: user, film-id: film-id}))
+)
+
+(define-read-only (get-film-review-stats (film-id uint))
+    (ok (map-get? film-review-stats film-id))
+)
+
+(define-read-only (has-user-reviewed (user principal) (film-id uint))
+    (ok (is-some (map-get? film-reviews {user: user, film-id: film-id})))
 )
 
 (define-public (transfer (token-id uint) (sender principal) (recipient principal))
@@ -214,7 +241,7 @@
         (revenue (default-to u0 (map-get? film-revenues film-id)))
     )
         (asserts! (is-eq tx-sender (get creator film)) err-owner-only)
-        (asserts! (> revenue u0) (err u110))
+        (asserts! (> revenue u0) (err u113))
         
         (try! (as-contract (stx-transfer? revenue tx-sender (get creator film))))
         (map-delete film-revenues film-id)
@@ -257,5 +284,35 @@
             (err err-film-not-found)
         )
         (err err-ticket-not-found)
+    )
+)
+
+(define-public (submit-film-review (film-id uint) (rating uint) (comment (string-ascii 500)))
+    (let (
+        (user-tickets (get-user-tickets tx-sender))
+        (current-stats (default-to {total-reviews: u0, average-rating: u0, total-rating-points: u0} 
+                                    (map-get? film-review-stats film-id)))
+        (new-total-reviews (+ (get total-reviews current-stats) u1))
+        (new-total-points (+ (get total-rating-points current-stats) rating))
+        (new-average (/ new-total-points new-total-reviews))
+    )
+        (asserts! (is-some (map-get? films film-id)) err-film-not-found)
+        (asserts! (and (>= rating u1) (<= rating u5)) err-invalid-rating)
+        (asserts! (is-some (index-of user-tickets film-id)) err-not-token-owner)
+        (asserts! (is-none (map-get? film-reviews {user: tx-sender, film-id: film-id})) err-already-reviewed)
+        
+        (map-set film-reviews {user: tx-sender, film-id: film-id} {
+            rating: rating,
+            comment: comment,
+            review-date: stacks-block-height
+        })
+        
+        (map-set film-review-stats film-id {
+            total-reviews: new-total-reviews,
+            average-rating: new-average,
+            total-rating-points: new-total-points
+        })
+        
+        (ok true)
     )
 )

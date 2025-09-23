@@ -14,10 +14,15 @@
 (define-constant err-already-reviewed (err u110))
 (define-constant err-invalid-rating (err u111))
 (define-constant err-review-not-found (err u112))
+(define-constant err-invalid-pricing-config (err u113))
+(define-constant err-pricing-not-enabled (err u114))
 
 (define-data-var last-token-id uint u0)
 (define-data-var last-film-id uint u0)
 (define-data-var platform-fee-rate uint u250)
+(define-data-var default-surge-multiplier uint u150)
+(define-data-var default-early-bird-discount uint u80)
+(define-data-var default-scarcity-threshold uint u80)
 
 (define-map films uint {
     title: (string-ascii 100),
@@ -56,6 +61,22 @@
     total-reviews: uint,
     average-rating: uint,
     total-rating-points: uint
+})
+
+(define-map film-pricing-config uint {
+    base-price: uint,
+    dynamic-pricing-enabled: bool,
+    surge-multiplier: uint,
+    early-bird-discount: uint,
+    early-bird-deadline: uint,
+    scarcity-threshold: uint,
+    last-price-update: uint
+})
+
+(define-map film-demand-metrics uint {
+    recent-purchases: uint,
+    demand-score: uint,
+    price-history: (list 10 uint)
 })
 
 (define-read-only (get-last-token-id)
@@ -114,6 +135,47 @@
     (ok (is-some (map-get? film-reviews {user: user, film-id: film-id})))
 )
 
+(define-read-only (get-film-pricing-config (film-id uint))
+    (ok (map-get? film-pricing-config film-id))
+)
+
+(define-read-only (get-film-demand-metrics (film-id uint))
+    (ok (map-get? film-demand-metrics film-id))
+)
+
+(define-read-only (calculate-current-price (film-id uint))
+    (let (
+        (film (unwrap! (map-get? films film-id) err-film-not-found))
+        (pricing-config (map-get? film-pricing-config film-id))
+        (demand-metrics (default-to {recent-purchases: u0, demand-score: u0, price-history: (list)} 
+                                    (map-get? film-demand-metrics film-id)))
+    )
+        (match pricing-config
+            config 
+            (if (get dynamic-pricing-enabled config)
+                (let (
+                    (base-price (get base-price config))
+                    (sold-ratio (/ (* (get sold-tickets film) u100) (get max-tickets film)))
+                    (blocks-until-event (- (get event-date film) stacks-block-height))
+                    (early-bird-active (> blocks-until-event (get early-bird-deadline config)))
+                    (is-scarce (>= sold-ratio (get scarcity-threshold config)))
+                    (demand-multiplier (if (> (get demand-score demand-metrics) u50) 
+                                         (get surge-multiplier config) u100))
+                    (scarcity-multiplier (if is-scarce u120 u100))
+                    (time-multiplier (if early-bird-active 
+                                       (get early-bird-discount config) u100))
+                    (final-price (/ (* (* (* base-price demand-multiplier) scarcity-multiplier) time-multiplier) 
+                                  u1000000))
+                )
+                    (ok final-price)
+                )
+                (ok (get base-price config))
+            )
+            (ok (get ticket-price film))
+        )
+    )
+)
+
 (define-public (transfer (token-id uint) (sender principal) (recipient principal))
     (begin
         (asserts! (is-eq tx-sender sender) err-not-token-owner)
@@ -126,6 +188,65 @@
             )
         )
         (ok true)
+    )
+)
+
+(define-public (enable-dynamic-pricing 
+    (film-id uint)
+    (base-price uint)
+    (early-bird-deadline uint)
+    (custom-surge-multiplier (optional uint))
+    (custom-early-bird-discount (optional uint))
+    (custom-scarcity-threshold (optional uint))
+)
+    (let (
+        (film (unwrap! (map-get? films film-id) err-film-not-found))
+        (surge-mult (default-to (var-get default-surge-multiplier) custom-surge-multiplier))
+        (early-discount (default-to (var-get default-early-bird-discount) custom-early-bird-discount))
+        (scarcity-thresh (default-to (var-get default-scarcity-threshold) custom-scarcity-threshold))
+    )
+        (asserts! (is-eq tx-sender (get creator film)) err-owner-only)
+        (asserts! (> base-price u0) err-invalid-pricing-config)
+        (asserts! (> early-bird-deadline stacks-block-height) err-invalid-pricing-config)
+        (asserts! (< early-bird-deadline (get event-date film)) err-invalid-pricing-config)
+        
+        (map-set film-pricing-config film-id {
+            base-price: base-price,
+            dynamic-pricing-enabled: true,
+            surge-multiplier: surge-mult,
+            early-bird-discount: early-discount,
+            early-bird-deadline: early-bird-deadline,
+            scarcity-threshold: scarcity-thresh,
+            last-price-update: stacks-block-height
+        })
+        
+        (map-set film-demand-metrics film-id {
+            recent-purchases: u0,
+            demand-score: u0,
+            price-history: (list base-price)
+        })
+        
+        (ok true)
+    )
+)
+
+(define-public (update-demand-score (film-id uint))
+    (let (
+        (current-metrics (default-to {recent-purchases: u0, demand-score: u0, price-history: (list)} 
+                                     (map-get? film-demand-metrics film-id)))
+        (recent-purchases (get recent-purchases current-metrics))
+        (new-score (if (<= (* recent-purchases u10) u100) 
+                      (* recent-purchases u10) u100))
+        (current-price (unwrap-panic (calculate-current-price film-id)))
+        (updated-history (unwrap-panic (as-max-len? 
+                           (append (get price-history current-metrics) current-price) u10)))
+    )
+        (map-set film-demand-metrics film-id {
+            recent-purchases: u0,
+            demand-score: new-score,
+            price-history: updated-history
+        })
+        (ok new-score)
     )
 )
 
@@ -169,12 +290,15 @@
     (let (
         (token-id (+ (var-get last-token-id) u1))
         (film (unwrap! (map-get? films film-id) err-film-not-found))
-        (platform-fee (/ (* (get ticket-price film) (var-get platform-fee-rate)) u10000))
-        (creator-payment (- (get ticket-price film) platform-fee))
+        (current-price (unwrap-panic (calculate-current-price film-id)))
+        (platform-fee (/ (* current-price (var-get platform-fee-rate)) u10000))
+        (creator-payment (- current-price platform-fee))
+        (current-metrics (default-to {recent-purchases: u0, demand-score: u0, price-history: (list)} 
+                                     (map-get? film-demand-metrics film-id)))
     )
         (asserts! (get active film) err-event-not-active)
         (asserts! (< (get sold-tickets film) (get max-tickets film)) err-minting-disabled)
-        (asserts! (>= (stx-get-balance tx-sender) (get ticket-price film)) err-insufficient-payment)
+        (asserts! (>= (stx-get-balance tx-sender) current-price) err-insufficient-payment)
         
         (try! (stx-transfer? creator-payment tx-sender (get creator film)))
         (try! (stx-transfer? platform-fee tx-sender contract-owner))
@@ -203,6 +327,12 @@
         (map-set film-revenues film-id 
             (+ (default-to u0 (map-get? film-revenues film-id)) creator-payment)
         )
+        
+        (map-set film-demand-metrics film-id {
+            recent-purchases: (+ (get recent-purchases current-metrics) u1),
+            demand-score: (get demand-score current-metrics),
+            price-history: (get price-history current-metrics)
+        })
         
         (var-set last-token-id token-id)
         (ok token-id)
@@ -241,7 +371,7 @@
         (revenue (default-to u0 (map-get? film-revenues film-id)))
     )
         (asserts! (is-eq tx-sender (get creator film)) err-owner-only)
-        (asserts! (> revenue u0) (err u113))
+        (asserts! (> revenue u0) err-invalid-pricing-config)
         
         (try! (as-contract (stx-transfer? revenue tx-sender (get creator film))))
         (map-delete film-revenues film-id)

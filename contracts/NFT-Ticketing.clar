@@ -16,9 +16,14 @@
 (define-constant err-review-not-found (err u112))
 (define-constant err-invalid-pricing-config (err u113))
 (define-constant err-pricing-not-enabled (err u114))
+(define-constant err-gift-expired (err u115))
+(define-constant err-gift-not-found (err u116))
+(define-constant err-gift-already-claimed (err u117))
+(define-constant err-cannot-gift-to-self (err u118))
 
 (define-data-var last-token-id uint u0)
 (define-data-var last-film-id uint u0)
+(define-data-var last-gift-id uint u0)
 (define-data-var platform-fee-rate uint u250)
 (define-data-var default-surge-multiplier uint u150)
 (define-data-var default-early-bird-discount uint u80)
@@ -78,6 +83,17 @@
     demand-score: uint,
     price-history: (list 10 uint)
 })
+
+(define-map ticket-gifts uint {
+    token-id: uint,
+    gifter: principal,
+    recipient: principal,
+    expiration: uint,
+    message: (string-ascii 200),
+    claimed: bool
+})
+
+(define-map pending-gifts-by-recipient principal (list 50 uint))
 
 (define-read-only (get-last-token-id)
     (ok (var-get last-token-id))
@@ -444,5 +460,101 @@
         })
         
         (ok true)
+    )
+)
+
+(define-read-only (get-gift (gift-id uint))
+    (ok (map-get? ticket-gifts gift-id))
+)
+
+(define-read-only (get-pending-gifts (recipient principal))
+    (ok (default-to (list) (map-get? pending-gifts-by-recipient recipient)))
+)
+
+(define-read-only (is-gift-valid (gift-id uint))
+    (match (map-get? ticket-gifts gift-id)
+        gift (ok (and 
+            (not (get claimed gift))
+            (> (get expiration gift) stacks-block-height)
+        ))
+        (err err-gift-not-found)
+    )
+)
+
+(define-public (create-ticket-gift 
+    (token-id uint) 
+    (recipient principal) 
+    (expiration-blocks uint)
+    (message (string-ascii 200))
+)
+    (let (
+        (gift-id (+ (var-get last-gift-id) u1))
+        (ticket (unwrap! (map-get? tickets token-id) err-ticket-not-found))
+        (expiration (+ stacks-block-height expiration-blocks))
+        (current-pending (default-to (list) (map-get? pending-gifts-by-recipient recipient)))
+    )
+        (asserts! (is-eq (some tx-sender) (nft-get-owner? film-ticket token-id)) err-not-token-owner)
+        (asserts! (not (is-eq tx-sender recipient)) err-cannot-gift-to-self)
+        (asserts! (not (get used ticket)) err-ticket-already-used)
+        
+        (try! (nft-transfer? film-ticket token-id tx-sender (as-contract tx-sender)))
+        
+        (map-set ticket-gifts gift-id {
+            token-id: token-id,
+            gifter: tx-sender,
+            recipient: recipient,
+            expiration: expiration,
+            message: message,
+            claimed: false
+        })
+        
+        (map-set pending-gifts-by-recipient recipient
+            (unwrap-panic (as-max-len? (append current-pending gift-id) u50))
+        )
+        
+        (var-set last-gift-id gift-id)
+        (ok gift-id)
+    )
+)
+
+(define-public (claim-gift (gift-id uint))
+    (let (
+        (gift (unwrap! (map-get? ticket-gifts gift-id) err-gift-not-found))
+        (token-id (get token-id gift))
+        (ticket (unwrap! (map-get? tickets token-id) err-ticket-not-found))
+    )
+        (asserts! (is-eq tx-sender (get recipient gift)) err-not-token-owner)
+        (asserts! (not (get claimed gift)) err-gift-already-claimed)
+        (asserts! (> (get expiration gift) stacks-block-height) err-gift-expired)
+        
+        (try! (as-contract (nft-transfer? film-ticket token-id tx-sender (get recipient gift))))
+        
+        (map-set tickets token-id (merge ticket {owner: tx-sender}))
+        
+        (map-set ticket-gifts gift-id (merge gift {claimed: true}))
+        
+        (let ((current-access (default-to (list) (map-get? user-access tx-sender))))
+            (map-set user-access tx-sender
+                (unwrap-panic (as-max-len? (append current-access (get film-id ticket)) u100))
+            )
+        )
+        
+        (ok token-id)
+    )
+)
+
+(define-public (revoke-gift (gift-id uint))
+    (let (
+        (gift (unwrap! (map-get? ticket-gifts gift-id) err-gift-not-found))
+        (token-id (get token-id gift))
+    )
+        (asserts! (is-eq tx-sender (get gifter gift)) err-not-token-owner)
+        (asserts! (not (get claimed gift)) err-gift-already-claimed)
+        
+        (try! (as-contract (nft-transfer? film-ticket token-id tx-sender (get gifter gift))))
+        
+        (map-set ticket-gifts gift-id (merge gift {claimed: true}))
+        
+        (ok token-id)
     )
 )
